@@ -1,0 +1,248 @@
+---
+title: "Demo for Insight Interview: Predict Time Series with ARIMA & HMM"
+author: "Chaoyi (Mina) Zheng"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align="center")
+library(depmixS4)
+library(DataCombine)
+library(expm)
+library(HiddenMarkov)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(knitr)
+library(lmtest)
+library(reshape2)
+library(kableExtra)
+library(jtools)
+library(broom)
+```
+
+## Load Data
+
+This data represents monthly number of major cancer surgery in New York State in a ten year period from 1997 to 2006. There are 120 data pionts in total.
+
+```{r data}
+total <- read.csv('C:/Users/zcyhi/Downloads/data.csv')
+total <- total %>%
+  select(month, total)
+kable(head(total), row.names=FALSE) %>% kable_styling(bootstrap_options = "striped", full_width = F)
+kable(tail(total), row.names=FALSE) %>% kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+## Recode Key Variables
+
+This step prepares variables for subsequent modeling.
+
+```{r recode}
+total <- slide(data = total, Var = 'total', NewVar = 'lag1', slideBy = -1)
+total <- slide(data = total, Var = 'total', NewVar = 'lag2', slideBy = -2)
+#kable(head(total), row.names=FALSE)  %>% kable_styling(bootstrap_options = "striped", full_width = F)
+
+total <- total %>%
+  mutate(post = as.numeric(month > 57),
+         monthpost = if_else(post == 1, month - 57, 0),
+         monthdummy = month %% 12,
+         date = ymd("1996-12-01") %m+% months(month)) %>%
+  arrange(month)
+
+cos <- cos(2 * pi * total$month/12)
+sin <- sin(2 * pi * total$month/12)
+
+total <- cbind.data.frame(total, cos, sin)
+kable(total[54:63,], row.names=FALSE)  %>% kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+\n
+## Plot Data
+
+```{r timeseriesplot}
+ggplot(total, aes(x = date, y = total, colour = as.factor(post))) +
+  geom_point() +
+  geom_path() +
+  labs(y = '', x = '') +
+  scale_colour_discrete(name = "", labels = c("Pre-Expansion", "Post-Expansion")) +
+  theme_minimal() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Monthly Total Number of Cancer Surgery Cases")
+```
+
+\n
+## Segmented Linear Regression (OLS)
+
+The standard approach is to regress the outcome measure (total) on time (month), indicator for intervention (post), and post-intervention time (postmonth). As results from this section shows, the residuals from this model are still autocorrelated, indicating this model is not adequate.
+
+We build models using the first 9 years of data, saving the last 1 year of data for testing. Prediction accuracy is measured by sum of squared errors (SSE).
+
+```{r OLS, echo = FALSE}
+lm <- lm(data=total[1:108,],
+         total ~ month + post + monthpost)
+#summ(lm)
+
+lm.pred <- predict(lm, total[109:120,])
+lm.sse <- sum((lm.pred-total[109:120, 2])^2)
+
+#acf(residuals(lm) , main='ACF of Segmented Regression Model')
+lm.qtest <- c(
+  Box.test(residuals(lm), type="Ljung-Box", lag=6)$p.value,
+  Box.test(residuals(lm), type="Ljung-Box", lag=12)$p.value,
+  Box.test(residuals(lm), type="Ljung-Box", lag=18)$p.value,
+  Box.test(residuals(lm), type="Ljung-Box", lag=24)$p.value
+)
+```
+
+\n
+## ARIMA Model with 1st Order and Seasonal Autoregression
+
+```{r ARIMA}
+ar <- arima(total[1:108,2],
+            order = c(1,0,0),
+            seasonal = list(order = c(1,0,0), period = 12),
+            xreg = total[1:108,c(1,5,6)])
+kable(tidy(coeftest(ar))) %>% kable_styling(bootstrap_options = "striped", full_width = F)
+
+ar.pred <- predict(ar, 12, newxreg = total[109:120, c(1,5,6)])$pred
+ar.sse <- sum((ar.pred-total[109:120, 2])^2)
+
+(acf(residuals(ar), main = 'ACF of AR(1)X(12) Model'))
+
+(ar.qtest <- c(
+  Box.test(residuals(ar), type="Ljung-Box", lag=6)$p.value,
+  Box.test(residuals(ar), type="Ljung-Box", lag=12)$p.value,
+  Box.test(residuals(ar), type="Ljung-Box", lag=18)$p.value,
+  Box.test(residuals(ar), type="Ljung-Box", lag=24)$p.value
+))
+```
+
+\n
+## HMM with 1st-Order Autoregression and Fourier Seasonal Terms
+
+This section fits a hidden Markov model (HMM) with 3 states for the latent Markov chain and normally distributed source distributions. This model also accounts for first-order autocorrelation and seasonal pattern.
+
+```{r HMM}
+set.seed(29)
+
+# FIT MODEL
+
+mod.lag <- depmix(
+  total ~ month + monthpost + post + lag1 + cos + sin,
+  data=total[3:108,], ns=3, family=gaussian())
+
+(fm.lag <- fit(mod.lag, 
+               verbose=F))
+
+
+# OBTAIN PARAMETER ESTIMATES
+
+## TRANSITION MATRIX
+kable(trans <- t(matrix(getpars(fm.lag)[4:12], c(3,3))))  %>% kable_styling(bootstrap_options = "striped", full_width = F)
+
+## OTHER PARAMETERS
+kable(pars <- cbind(getpars(fm.lag)[13:19],getpars(fm.lag)[21:27],getpars(fm.lag)[29:35]))  %>% kable_styling(bootstrap_options = "striped", full_width = F)
+ 
+## INITIAL AND ENDING DISTRIBUTIONS
+init<-t(matrix(getpars(fm.lag)[1:3], c(3,1)))
+end.distr <- as.matrix(posterior(fm.lag)[106,2:4])
+
+## PREDICTED VALUES FOR YEARS 1997 TO 2005
+base <- cbind.data.frame(
+  rep(1,106),
+  select(total[3:108,], month, monthpost, post, lag1, cos, sin))
+base <- as.matrix(base) %*% pars
+
+pred<-NULL
+for (i in 1 : 106){
+  pred<-c(pred, as.matrix(attributes(fm.lag)$posterior[i,2:4]) %*% base[i,])
+}
+
+## SSE FOR FORECAST VALUES FOR YEAR 2006
+forecast.base <- cbind.data.frame(
+  rep(1,12),
+  select(total[109:120,], month, monthpost, post, lag1, cos, sin))
+
+forecast.distr <- matrix(0, nrow = 12, ncol = 3)
+for (i in (1:12)){
+  forecast.distr[i,] <- end.distr %*% (trans %^% i)
+}
+
+forecast.m <- as.matrix(forecast.base) %*% as.matrix(pars)
+hmm.forecast <- NULL
+for (i in (1:12)){
+  hmm.forecast <- c(hmm.forecast, forecast.m[i,] %*% t(t(forecast.distr[i,])))
+}
+
+hmm.sse <- sum((hmm.forecast-total$total[109:120])^2)
+
+## EXAMINE DISTRIBUTION OF PSEUDO-RESIDUALS
+
+design <- cbind.data.frame(
+  rep(1,106),
+  select(total[3:108,], month, monthpost, post, lag1, cos, sin))
+
+HidMarkov <- mmglm1(
+  total[3:108, 2],
+  Pi = trans,
+  delta = c(1,0,0),
+  glmfamily = gaussian(link = "identity"),
+  beta = pars,
+  Xdesign = as.matrix(design),
+  sigma = c(getpars(fm.lag)[c(20,28,36)]))
+
+res <- residuals(HidMarkov)
+
+plot(density(res), main="Gaussian HMM: Pseudo Residuals")
+box()
+qqnorm(res, main="Gaussian HMM: Q-Q Plot of Pseudo Residuals")
+abline(a=0, b=1, lty=3)
+abline(h=seq(-2, 2, 1), lty=3)
+abline(v=seq(-2, 2, 1), lty=3)
+
+```
+
+\n
+## Summary: Compare Predictions and Forecast between ARIMA and HMM
+
+```{r summary}
+
+pred.table = cbind.data.frame(
+  1:106,
+  total[3:108, 2],
+  total[3:108, 2] - residuals(ar)[3:108],
+  pred
+)
+colnames(pred.table) <- c('Time', 'Observed', 'Predicted: ARIMA', 'Predicted: HMM')
+pred.table <- pred.table %>%
+  mutate(`Residual: ARIMA` = `Predicted: ARIMA` - Observed,
+         `Residual: HMM` = `Predicted: HMM` - Observed)
+
+pred.values <- melt(pred.table[, 1:4], id.vars = c('Time', 'Observed'))
+res.values <- melt(pred.table[, c(1,2,5,6)], id.vars = c('Time', 'Observed'))
+(ggplot(data=pred.values) +
+  geom_line(aes(x = Time, y = Observed), alpha = 0.6) +
+  geom_point(aes(x = Time, y = value, colour = variable))) +
+  theme_minimal() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  labs(y = '', x = '') +
+  scale_colour_discrete(name = "") +
+  ggtitle("Predicted vs. Observed")
+
+(ggplot(res.values,
+        aes(x = value, colour = variable)) +
+  geom_density(alpha = 0.5) +
+  theme_minimal() +
+  theme(legend.position = 'bottom', plot.title = element_text(hjust = 0.5)) +
+  scale_colour_discrete(name = "") +
+  ggtitle("Residuals"))
+
+summary.table = cbind.data.frame(
+  c('OLS', 'ARIMA', 'HMM'),
+  c(lm.sse, ar.sse, hmm.sse),
+  c(AIC(lm), AIC(ar), NA))
+colnames(summary.table) = c('Model', 'Forecast SSE', 'AIC')
+kable(summary.table) %>% kable_styling(bootstrap_options = "striped", full_width = F)
+
+```
