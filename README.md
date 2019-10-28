@@ -2,7 +2,7 @@
 
 This was a project for my master's thesis in biostats, where I experimented with two time series appoaches (ARIMA and HMM) to see how they can help assess outcomes of policy changes.
 
-The code for this project was written in R Markdown.
+The code for this project was written in R Markdown. File "Demo.pdf" shows both code and output, similar to Jupyter notebook.
 
 ### Figure 1. The ARMA Process
 
